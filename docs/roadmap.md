@@ -10,7 +10,7 @@ Audited free/legal/reproducible data sources (June 2026). Key findings recorded 
 
 ## Phase 1 — Milestone 1: offline walk-forward — "can the model match the close?" ⟵ NEXT
 
-- **Scope:** Premier League + Bundesliga, ~10 seasons (2014/15–2024/25, aligned to Understat's xG start for later reuse), market = Over/Under 2.5.
+- **Scope:** Premier League + Bundesliga, market = Over/Under 2.5. **Walk-forward evaluation on 2019/20–2024/25** (~4,116 matches — the seasons that actually carry a Pinnacle *closing* O/U 2.5 line, verified in `reports/m1_data_coverage.md`); **2014/15–2018/19 serve as goals-only warm-up** for the expanding-window fit. (The earlier seasons carry O/U only as Betbrain aggregates — usable for fitting, not as a sharp-close benchmark.)
 - **Model:** time-weighted independent Poisson (ADR-0006), *pure* — no extra features. Establish the floor.
 - **Protocol:** ADR-0007 — expanding-window walk-forward, de-vigged Pinnacle close benchmark, calibration + log-loss + Brier, sliced and block-bootstrapped.
 - **Needs none of the platform** — Python, the data, a walk-forward harness, an evaluation notebook.
