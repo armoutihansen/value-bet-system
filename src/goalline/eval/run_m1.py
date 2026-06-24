@@ -1,0 +1,179 @@
+"""Run the Milestone 1 walk-forward and report the go/no-go verdict.
+
+    uv run python -m goalline.eval.run_m1
+
+Loads the normalized dataset, runs the walk-forward over 2019/20-2024/25
+(Pinnacle closing benchmark), and reports calibration + model-vs-close, overall
+and sliced, with a block-bootstrap CI on the headline log-loss gap. Writes a
+derived report (aggregate metrics only) to reports/m1_results.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from . import metrics
+from .walkforward import walk_forward
+
+EVAL_SEASONS = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25"]
+COVID_SEASON = "2019/20"
+
+
+def _row_log_loss(y, p) -> np.ndarray:
+    p = np.clip(np.asarray(p, dtype=float), 1e-12, 1 - 1e-12)
+    y = np.asarray(y, dtype=float)
+    return -(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+
+def _summary(df: pd.DataFrame) -> dict:
+    y = df["outcome"]
+    # gap = LL_close - LL_model: positive => model beats the close.
+    gap = metrics.log_loss(y, df["market_prob"]) - metrics.log_loss(y, df["model_prob"])
+    return {
+        "n": len(df),
+        "ll_model": round(metrics.log_loss(y, df["model_prob"]), 5),
+        "ll_close": round(metrics.log_loss(y, df["market_prob"]), 5),
+        "gap": round(gap, 5),
+        "brier_model": round(metrics.brier(y, df["model_prob"]), 5),
+        "brier_close": round(metrics.brier(y, df["market_prob"]), 5),
+        "ece_model": round(metrics.ece(y, df["model_prob"]), 4),
+        "ece_close": round(metrics.ece(y, df["market_prob"]), 4),
+    }
+
+
+def _bootstrap_gap_ci(df: pd.DataFrame, n_boot: int = 2000, seed: int = 0) -> tuple[float, float]:
+    """Block bootstrap (block = league x ISO week) CI for LL_close - LL_model."""
+    work = df.assign(
+        _lm=_row_log_loss(df["outcome"], df["model_prob"]),
+        _lc=_row_log_loss(df["outcome"], df["market_prob"]),
+    )
+    blocks = work.groupby(["league", "week"]).agg(
+        sm=("_lm", "sum"), sc=("_lc", "sum"), n=("_lm", "size")
+    )
+    sm, sc, nn = blocks["sm"].to_numpy(), blocks["sc"].to_numpy(), blocks["n"].to_numpy()
+    n_blocks = len(blocks)
+    rng = np.random.default_rng(seed)
+    gaps = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n_blocks, n_blocks)
+        total = nn[idx].sum()
+        gaps[i] = sc[idx].sum() / total - sm[idx].sum() / total
+    return float(np.percentile(gaps, 2.5)), float(np.percentile(gaps, 97.5))
+
+
+def _slice_table(df: pd.DataFrame, by: str) -> pd.DataFrame:
+    rows = []
+    for key, g in df.groupby(by):
+        s = _summary(g)
+        s[by] = key
+        rows.append(s)
+    cols = [by, "n", "ll_model", "ll_close", "gap", "ece_model", "ece_close"]
+    return pd.DataFrame(rows)[cols]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Run the Milestone 1 walk-forward.")
+    ap.add_argument("--data", type=Path, default=Path("data/processed/m1_dataset.parquet"))
+    ap.add_argument("--report", type=Path, default=Path("reports/m1_results.md"))
+    ap.add_argument("--half-life", type=float, default=180.0)
+    args = ap.parse_args()
+
+    dataset = pd.read_parquet(args.data)
+    print(f"Loaded {len(dataset)} matches. Running walk-forward (half-life={args.half_life}d) ...")
+    preds = walk_forward(dataset, EVAL_SEASONS, half_life_days=args.half_life)
+    print(f"{len(preds)} out-of-sample predictions.")
+
+    overall = _summary(preds)
+    lo, hi = _bootstrap_gap_ci(preds)
+    by_season = _slice_table(preds, "season")
+    by_league = _slice_table(preds, "league")
+    reliability = metrics.reliability_table(preds["outcome"], preds["model_prob"])
+
+    print("\n=== Overall (model vs de-vigged Pinnacle close) ===")
+    print(f"  log-loss:  model {overall['ll_model']}  close {overall['ll_close']}  "
+          f"gap {overall['gap']:+.5f}  95% CI [{lo:+.5f}, {hi:+.5f}]")
+    print(f"  Brier:     model {overall['brier_model']}  close {overall['brier_close']}")
+    print(f"  ECE:       model {overall['ece_model']}  close {overall['ece_close']}")
+    print("\n=== By season ===")
+    print(by_season.to_string(index=False))
+    print("\n=== By league ===")
+    print(by_league.to_string(index=False))
+
+    verdict = _verdict(overall, (lo, hi), by_season, by_league)
+    print("\n=== Verdict ===")
+    print(verdict)
+
+    _write_report(
+        args.report, overall, (lo, hi), by_season, by_league, reliability, verdict, args.half_life
+    )
+    print(f"\nWrote {args.report}")
+    return 0
+
+
+def _verdict(overall, ci, by_season, by_league) -> str:
+    lo, hi = ci
+    calibrated = overall["ece_model"] < 0.03
+    beats_overall = lo > 0
+    pos_slices = pd.concat([by_season.rename(columns={"season": "slice"}),
+                            by_league.rename(columns={"league": "slice"})])
+    pos = pos_slices[pos_slices["gap"] >= 0]["slice"].tolist()
+    lines = [
+        f"- Calibrated (model ECE {overall['ece_model']} < 0.03): {'YES' if calibrated else 'NO'}",
+        f"- Beats close overall (gap CI lower bound > 0): {'YES' if beats_overall else 'NO'}",
+        f"- Slices where model matches/beats close (gap >= 0): {pos or 'none'}",
+    ]
+    if beats_overall:
+        lines.append("=> GO: model beats the close overall.")
+    elif calibrated and pos:
+        lines.append("=> CONDITIONAL: calibrated, and beats the close in some slice(s) — "
+                     "treat as a hypothesis to confirm out-of-sample before building further.")
+    else:
+        lines.append("=> NO-GO under ADR-0007's bar: the close is not beaten. "
+                     "An honest 'efficient market' result.")
+    return "\n".join(lines)
+
+
+def _write_report(path, overall, ci, by_season, by_league, reliability, verdict, half_life) -> None:
+    lo, hi = ci
+    path.parent.mkdir(parents=True, exist_ok=True)
+    md = [
+        "# Milestone 1 — results (derived; safe to commit)",
+        "",
+        "Generated by `goalline.eval.run_m1`. Aggregate metrics only.",
+        f"Model: time-weighted Poisson (half-life {half_life:.0f}d). "
+        "Benchmark: de-vigged Pinnacle closing O/U 2.5. Eval: 2019/20–2024/25, walk-forward.",
+        "",
+        "## Headline (gap = LL_close − LL_model; positive ⇒ model beats the close)",
+        "",
+        f"- log-loss: model **{overall['ll_model']}**, close **{overall['ll_close']}**, "
+        f"gap **{overall['gap']:+.5f}**, 95% CI **[{lo:+.5f}, {hi:+.5f}]**",
+        f"- Brier: model {overall['brier_model']}, close {overall['brier_close']}",
+        f"- ECE: model {overall['ece_model']}, close {overall['ece_close']}  (n={overall['n']})",
+        "",
+        "## By season",
+        "",
+        by_season.to_markdown(index=False),
+        "",
+        f"_{COVID_SEASON} is the COVID / empty-stadium season (distorted home advantage)._",
+        "",
+        "## By league",
+        "",
+        by_league.to_markdown(index=False),
+        "",
+        "## Model reliability (calibration)",
+        "",
+        reliability.to_markdown(index=False),
+        "",
+        "## Verdict",
+        "",
+        verdict,
+    ]
+    path.write_text("\n".join(md) + "\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
