@@ -40,8 +40,14 @@ def check_dataset(df: pd.DataFrame) -> QualityReport:
 
     for col in ("over_odds", "under_odds", "home_odds", "draw_odds", "away_odds"):
         present = df[col].notna()
-        bad = int((present & (pd.to_numeric(df[col], errors="coerce") <= 1.0)).sum())
-        r.add(f"{col}_valid_decimal", bad == 0, f"{bad} of {int(present.sum())} present are <= 1.0")
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        # Present but non-numeric (coerced to NaN) is invalid too, not only <= 1.0.
+        bad = int((present & (numeric.isna() | (numeric <= 1.0))).sum())
+        r.add(
+            f"{col}_valid_decimal",
+            bad == 0,
+            f"{bad} of {int(present.sum())} present are non-numeric or <= 1.0",
+        )
 
     future = int((df["date"] > pd.Timestamp.now()).sum())
     r.add("no_future_dates", future == 0, f"{future} rows dated in the future")

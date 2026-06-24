@@ -8,12 +8,14 @@ from goalline.data.quality import check_dataset
 
 
 def _clean() -> pd.DataFrame:
+    # Dates relative to "now" so the no_future_dates check is never time-dependent.
+    base = pd.Timestamp.now().normalize() - pd.Timedelta(days=10)
     return pd.DataFrame(
         {
             "season": ["2024/25"] * 3,
             "league": ["Premier League"] * 3,
             "division": ["E0"] * 3,
-            "date": pd.to_datetime(["2024-08-15", "2024-08-16", "2024-08-17"]),
+            "date": [base, base + pd.Timedelta(days=1), base + pd.Timedelta(days=2)],
             "home_team": ["A", "B", "C"],
             "away_team": ["X", "Y", "Z"],
             "home_goals": [2, 1, 0],
@@ -55,3 +57,16 @@ def test_inconsistent_target_is_caught():
     df = _clean()
     df.loc[1, "over_2_5"] = True  # total is 1, cannot be Over 2.5
     assert _status(df)["over_2_5_consistent"] is False
+
+
+def test_future_date_is_caught():
+    df = _clean()
+    df.loc[0, "date"] = pd.Timestamp.now() + pd.Timedelta(days=365)
+    assert _status(df)["no_future_dates"] is False
+
+
+def test_non_numeric_odds_is_caught():
+    df = _clean()
+    df["over_odds"] = df["over_odds"].astype(object)
+    df.loc[0, "over_odds"] = "n/a"  # present but non-numeric
+    assert _status(df)["over_odds_valid_decimal"] is False

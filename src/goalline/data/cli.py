@@ -67,7 +67,7 @@ def _write_report(path: Path, cov, df, report) -> None:
         "",
         "## Per league-season column coverage",
         "",
-        cov.to_markdown(index=False),
+        cov.fillna("—").to_markdown(index=False),
         "",
         "## Normalized dataset",
         "",

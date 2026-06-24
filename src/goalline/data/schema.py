@@ -22,7 +22,9 @@ CORE: dict[str, str] = {
 TIME_COL = "Time"  # kickoff time; present only from ~2019/20
 
 # Over/Under 2.5 benchmark candidates, sharpest + closing first.
-# (over_column, under_column, provenance). The first fully-present pair wins.
+# (over_column, under_column, provenance). The first pair whose BOTH columns are
+# present in the file wins (presence only — per-row fill can still vary, which is
+# why coverage.py reports fill-rates and quality.py validates the values).
 OU_2_5_CANDIDATES: list[tuple[str, str, str]] = [
     ("PC>2.5", "PC<2.5", "pinnacle_closing"),
     ("P>2.5", "P<2.5", "pinnacle_prematch"),
