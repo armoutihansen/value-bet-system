@@ -2,14 +2,15 @@
 
 For a match between home team h and away team a:
 
-    lambda_home = exp(mu + home_adv + attack[h] - defense[a])
-    lambda_away = exp(mu          + attack[a] - defense[h])
+    lambda_home = exp(mu + home_adv + attack[h] - defense[a] + theta*x)
+    lambda_away = exp(mu          + attack[a] - defense[h] - theta*x)
 
-Parameters are fit by maximum likelihood on past matches, each weighted by an
-exponential time-decay (recent matches count more). The attack/defense vectors
-are unidentified up to a constant, so a small ridge penalty pins them and they
-are reported mean-centered (mu absorbs the shift — predictions are unchanged).
-An analytic gradient keeps the many walk-forward refits fast.
+where x is an optional per-match covariate (e.g. scaled Elo difference) and
+theta its coefficient. Parameters are fit by maximum likelihood on past matches,
+each weighted by an exponential time-decay. attack/defense are unidentified up
+to a constant, so a small ridge penalty pins them and they are reported
+mean-centered (mu absorbs the shift). An analytic gradient keeps the many
+walk-forward refits fast. With no covariate the fit is identical to the baseline.
 """
 
 from __future__ import annotations
@@ -23,19 +24,24 @@ from scipy.optimize import minimize
 
 @dataclass(frozen=True)
 class FittedPoisson:
-    """A fitted model. Unseen teams (e.g. just-promoted) default to league-average
-    strength (attack = defense = 0)."""
+    """A fitted model. Unseen teams default to league-average strength
+    (attack = defense = 0)."""
 
     mu: float
     home_adv: float
     attack: dict[str, float]
     defense: dict[str, float]
+    covariate_coef: float = 0.0  # theta; 0.0 when no covariate was used
 
-    def lambdas(self, home_team: str, away_team: str) -> tuple[float, float]:
+    def lambdas(
+        self, home_team: str, away_team: str, covariate: float = 0.0
+    ) -> tuple[float, float]:
         a_h, d_h = self.attack.get(home_team, 0.0), self.defense.get(home_team, 0.0)
         a_a, d_a = self.attack.get(away_team, 0.0), self.defense.get(away_team, 0.0)
-        lam_home = np.exp(self.mu + self.home_adv + a_h - d_a)
-        lam_away = np.exp(self.mu + a_a - d_h)
+        x = covariate if covariate == covariate else 0.0  # NaN -> 0
+        c = self.covariate_coef * x
+        lam_home = np.exp(self.mu + self.home_adv + a_h - d_a + c)
+        lam_away = np.exp(self.mu + a_a - d_h - c)
         return float(lam_home), float(lam_away)
 
 
@@ -50,14 +56,17 @@ def fit_poisson(
     *,
     half_life_days: float = 180.0,
     ridge: float = 1e-4,
+    covariate_col: str | None = None,
 ) -> FittedPoisson:
     """Fit on matches strictly before ``as_of`` (leakage-safe by construction).
 
-    ``matches`` needs columns: date, home_team, away_team, home_goals, away_goals.
+    Requires columns: date, home_team, away_team, home_goals, away_goals (and
+    ``covariate_col`` if given).
     """
-    df = matches[matches["date"] < as_of].dropna(
-        subset=["home_team", "away_team", "home_goals", "away_goals", "date"]
-    )
+    required = ["home_team", "away_team", "home_goals", "away_goals", "date"]
+    if covariate_col is not None:
+        required = [*required, covariate_col]
+    df = matches[matches["date"] < as_of].dropna(subset=required)
     if df.empty:
         raise ValueError("no training matches before as_of")
 
@@ -71,36 +80,46 @@ def fit_poisson(
     ga = df["away_goals"].to_numpy(dtype=float)
     w = time_weights(df["date"], as_of, half_life_days)
 
-    def objective(theta: np.ndarray) -> tuple[float, np.ndarray]:
-        mu, home_adv = theta[0], theta[1]
-        att, dfn = theta[2 : 2 + n], theta[2 + n : 2 + 2 * n]
-        eta_h = mu + home_adv + att[hi] - dfn[ai]
-        eta_a = mu + att[ai] - dfn[hi]
+    has_cov = covariate_col is not None
+    x = df[covariate_col].to_numpy(dtype=float) if has_cov else None
+    n_base = 2 + 2 * n  # mu, home_adv, attack, defense
+    n_params = n_base + (1 if has_cov else 0)
+
+    def objective(vec: np.ndarray) -> tuple[float, np.ndarray]:
+        mu, home_adv = vec[0], vec[1]
+        att, dfn = vec[2 : 2 + n], vec[2 + n : n_base]
+        cterm = vec[n_base] * x if has_cov else 0.0
+        eta_h = mu + home_adv + att[hi] - dfn[ai] + cterm
+        eta_a = mu + att[ai] - dfn[hi] - cterm
         lam_h, lam_a = np.exp(eta_h), np.exp(eta_a)
 
         ll = np.sum(w * (gh * eta_h - lam_h) + w * (ga * eta_a - lam_a))
-        nll = -ll + ridge * np.sum(theta[2:] ** 2)
+        nll = -ll + ridge * np.sum(vec[2:n_base] ** 2)  # ridge on attack/defense only
 
-        rh = w * (gh - lam_h)  # d(ll)/d(eta_home)
-        ra = w * (ga - lam_a)  # d(ll)/d(eta_away)
+        rh = w * (gh - lam_h)
+        ra = w * (ga - lam_a)
         g_att = np.zeros(n)
         g_def = np.zeros(n)
         np.add.at(g_att, hi, rh)
         np.add.at(g_att, ai, ra)
         np.add.at(g_def, ai, -rh)
         np.add.at(g_def, hi, -ra)
-        grad_ll = np.concatenate([[rh.sum() + ra.sum(), rh.sum()], g_att, g_def])
-        grad = -grad_ll
-        grad[2:] += 2 * ridge * theta[2:]
+        grad = np.concatenate([[rh.sum() + ra.sum(), rh.sum()], g_att, g_def])
+        if has_cov:
+            grad = np.concatenate([grad, [np.sum(x * (rh - ra))]])
+        grad = -grad
+        grad[2:n_base] += 2 * ridge * vec[2:n_base]
         return nll, grad
 
-    res = minimize(objective, np.zeros(2 + 2 * n), jac=True, method="L-BFGS-B")
+    res = minimize(objective, np.zeros(n_params), jac=True, method="L-BFGS-B")
     mu, home_adv = float(res.x[0]), float(res.x[1])
-    att, dfn = res.x[2 : 2 + n], res.x[2 + n : 2 + 2 * n]
+    att, dfn = res.x[2 : 2 + n], res.x[2 + n : n_base]
+    cov_coef = float(res.x[n_base]) if has_cov else 0.0
 
-    # Mean-center attack/defense (mu absorbs the shift; lambdas unchanged).
     a_mean, d_mean = float(att.mean()), float(dfn.mean())
     mu_centered = mu + a_mean - d_mean
     attack = {t: float(att[index[t]] - a_mean) for t in teams}
     defense = {t: float(dfn[index[t]] - d_mean) for t in teams}
-    return FittedPoisson(mu=mu_centered, home_adv=home_adv, attack=attack, defense=defense)
+    return FittedPoisson(
+        mu=mu_centered, home_adv=home_adv, attack=attack, defense=defense, covariate_coef=cov_coef
+    )

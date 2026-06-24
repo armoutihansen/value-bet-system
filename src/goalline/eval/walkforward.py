@@ -27,6 +27,7 @@ def walk_forward(
     half_life_days: float = 180.0,
     min_train_matches: int = 200,
     benchmark_source: str = "pinnacle_closing",
+    covariate_col: str | None = None,
     progress: Callable[[str, int], None] | None = None,
 ) -> pd.DataFrame:
     results = []
@@ -47,10 +48,13 @@ def walk_forward(
             train = g[g["date"] < as_of]
             if len(train) < min_train_matches:
                 continue
-            fitted = fit_poisson(train, as_of=as_of, half_life_days=half_life_days)
+            fitted = fit_poisson(
+                train, as_of=as_of, half_life_days=half_life_days, covariate_col=covariate_col
+            )
             n_fits += 1
             for r in wk_matches.itertuples():
-                lam_h, lam_a = fitted.lambdas(r.home_team, r.away_team)
+                x = getattr(r, covariate_col) if covariate_col else 0.0
+                lam_h, lam_a = fitted.lambdas(r.home_team, r.away_team, x)
                 p_over_market, _ = devig_two_way(r.over_odds, r.under_odds)
                 results.append(
                     {

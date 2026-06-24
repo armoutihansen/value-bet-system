@@ -60,3 +60,32 @@ def test_fit_ignores_matches_on_or_after_as_of():
     )
     with_future = fit_poisson(pd.concat([df, absurd_future]), as_of, half_life_days=100_000)
     assert baseline.lambdas("A", "B") == with_future.lambdas("A", "B")
+
+
+def test_no_covariate_gives_zero_coefficient():
+    df, _, _ = _simulate()
+    fit = fit_poisson(df, as_of=df["date"].max() + pd.Timedelta(days=1))
+    assert fit.covariate_coef == 0.0
+
+
+def test_fit_recovers_positive_covariate_effect():
+    rng = np.random.default_rng(2)
+    teams = [f"T{i}" for i in range(6)]
+    base = pd.Timestamp("2022-01-01")
+    true_theta = 0.5
+    rows = []
+    for _ in range(40):
+        for h in teams:
+            for a in teams:
+                if h == a:
+                    continue
+                x = float(rng.normal())
+                lam_h = np.exp(0.2 + 0.2 + true_theta * x)
+                lam_a = np.exp(0.2 - true_theta * x)
+                day = base + pd.Timedelta(days=len(rows))
+                rows.append((day, h, a, rng.poisson(lam_h), rng.poisson(lam_a), x))
+    cols = ["date", "home_team", "away_team", "home_goals", "away_goals", "cov"]
+    df = pd.DataFrame(rows, columns=cols)
+    as_of = df["date"].max() + pd.Timedelta(days=1)
+    fit = fit_poisson(df, as_of=as_of, half_life_days=100_000, covariate_col="cov")
+    assert fit.covariate_coef > 0.2  # true effect 0.5, recovered with the right sign
