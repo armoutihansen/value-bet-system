@@ -1,0 +1,16 @@
+# Fetched data is NEVER committed — football-data.co.uk is fetched at build time
+# under a non-redistribution posture (see docs/data-lineage.md, ADR-0003/0004).
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# uv
+uv.lock
