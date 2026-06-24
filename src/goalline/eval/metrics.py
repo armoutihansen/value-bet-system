@@ -64,3 +64,36 @@ def log_loss_skill(y, p_model, p_ref) -> float:
 
 def brier_skill(y, p_model, p_ref) -> float:
     return 1.0 - brier(y, p_model) / brier(y, p_ref)
+
+
+def row_log_loss(y, p) -> np.ndarray:
+    """Per-row log loss, for bootstrap aggregation."""
+    y, p = _arrays(y, p)
+    return -(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+
+def block_bootstrap_gap_ci(
+    outcome, model_prob, ref_prob, blocks, *, n_boot: int = 2000, seed: int = 0
+):
+    """95% CI for gap = LL_ref - LL_model (positive => model beats ref).
+
+    Resamples whole blocks (e.g. league x ISO week) with replacement to respect
+    the data's dependence structure (ADR-0007).
+    """
+    frame = pd.DataFrame(
+        {
+            "block": np.asarray(blocks),
+            "lm": row_log_loss(outcome, model_prob),
+            "lr": row_log_loss(outcome, ref_prob),
+        }
+    )
+    agg = frame.groupby("block").agg(sm=("lm", "sum"), sr=("lr", "sum"), n=("lm", "size"))
+    sm, sr, nn = agg["sm"].to_numpy(), agg["sr"].to_numpy(), agg["n"].to_numpy()
+    n_blocks = len(agg)
+    rng = np.random.default_rng(seed)
+    gaps = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n_blocks, n_blocks)
+        total = nn[idx].sum()
+        gaps[i] = sr[idx].sum() / total - sm[idx].sum() / total
+    return float(np.percentile(gaps, 2.5)), float(np.percentile(gaps, 97.5))
