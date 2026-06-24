@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from . import metrics
@@ -21,12 +20,6 @@ from .walkforward import walk_forward
 
 EVAL_SEASONS = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25"]
 COVID_SEASON = "2019/20"
-
-
-def _row_log_loss(y, p) -> np.ndarray:
-    p = np.clip(np.asarray(p, dtype=float), 1e-12, 1 - 1e-12)
-    y = np.asarray(y, dtype=float)
-    return -(y * np.log(p) + (1 - y) * np.log(1 - p))
 
 
 def _summary(df: pd.DataFrame) -> dict:
@@ -43,26 +36,6 @@ def _summary(df: pd.DataFrame) -> dict:
         "ece_model": round(metrics.ece(y, df["model_prob"]), 4),
         "ece_close": round(metrics.ece(y, df["market_prob"]), 4),
     }
-
-
-def _bootstrap_gap_ci(df: pd.DataFrame, n_boot: int = 2000, seed: int = 0) -> tuple[float, float]:
-    """Block bootstrap (block = league x ISO week) CI for LL_close - LL_model."""
-    work = df.assign(
-        _lm=_row_log_loss(df["outcome"], df["model_prob"]),
-        _lc=_row_log_loss(df["outcome"], df["market_prob"]),
-    )
-    blocks = work.groupby(["league", "week"]).agg(
-        sm=("_lm", "sum"), sc=("_lc", "sum"), n=("_lm", "size")
-    )
-    sm, sc, nn = blocks["sm"].to_numpy(), blocks["sc"].to_numpy(), blocks["n"].to_numpy()
-    n_blocks = len(blocks)
-    rng = np.random.default_rng(seed)
-    gaps = np.empty(n_boot)
-    for i in range(n_boot):
-        idx = rng.integers(0, n_blocks, n_blocks)
-        total = nn[idx].sum()
-        gaps[i] = sc[idx].sum() / total - sm[idx].sum() / total
-    return float(np.percentile(gaps, 2.5)), float(np.percentile(gaps, 97.5))
 
 
 def _slice_table(df: pd.DataFrame, by: str) -> pd.DataFrame:
@@ -88,7 +61,10 @@ def main() -> int:
     print(f"{len(preds)} out-of-sample predictions.")
 
     overall = _summary(preds)
-    lo, hi = _bootstrap_gap_ci(preds)
+    lo, hi = metrics.block_bootstrap_gap_ci(
+        preds["outcome"], preds["model_prob"], preds["market_prob"],
+        preds["league"].astype(str) + "|" + preds["week"].astype(str),
+    )
     by_season = _slice_table(preds, "season")
     by_league = _slice_table(preds, "league")
     reliability = metrics.reliability_table(preds["outcome"], preds["model_prob"])
